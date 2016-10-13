@@ -1,41 +1,63 @@
 package direct
 
 import (
-	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/cloudflare/golibs/lrucache"
-	"github.com/golang/glog"
-	"github.com/phuslu/goproxy/httpproxy"
-	"github.com/phuslu/goproxy/httpproxy/filters"
+	"github.com/phuslu/glog"
+
+	"../../filters"
+	"../../helpers"
+	"../../proxy"
+	"../../storage"
 )
 
 const (
 	filterName string = "direct"
 )
 
-type RateLimit struct {
-	Threshold int64
-	Rate      float64
-	Capacity  int64
+type Config struct {
+	Transport struct {
+		Dialer struct {
+			Timeout        int
+			KeepAlive      int
+			DualStack      bool
+			DNSCacheExpiry int
+			DNSCacheSize   uint
+		}
+		Proxy struct {
+			Enabled bool
+			URL     string
+		}
+		TLSClientConfig struct {
+			InsecureSkipVerify     bool
+			ClientSessionCacheSize int
+		}
+		DisableKeepAlives   bool
+		DisableCompression  bool
+		TLSHandshakeTimeout int
+		MaxIdleConnsPerHost int
+	}
 }
 
 type Filter struct {
+	Config
 	filters.RoundTripFilter
 	transport *http.Transport
-	ratelimt  RateLimit
 }
 
 func init() {
 	filename := filterName + ".json"
-	config, err := NewConfig(filters.LookupConfigStoreURI(filterName), filename)
+	config := new(Config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
-		glog.Fatalf("NewConfig(%#v) failed: %s", filename, err)
+		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
 	}
 
 	err = filters.Register(filterName, &filters.RegisteredFilter{
@@ -50,41 +72,65 @@ func init() {
 }
 
 func NewFilter(config *Config) (filters.Filter, error) {
-	d := &Dailer{}
-	d.Timeout = time.Duration(config.Dialer.Timeout) * time.Second
-	d.KeepAlive = time.Duration(config.Dialer.KeepAlive) * time.Second
-	d.DNSCache = lrucache.NewMultiLRUCache(4, uint(config.DNSCache.Size))
-	d.DNSCacheExpires = time.Duration(config.DNSCache.Expires) * time.Second
-	d.LoopbackAddrs = make(map[string]struct{})
+	d := &helpers.Dialer{
+		Dialer: &net.Dialer{
+			KeepAlive: time.Duration(config.Transport.Dialer.KeepAlive) * time.Second,
+			Timeout:   time.Duration(config.Transport.Dialer.Timeout) * time.Second,
+			DualStack: config.Transport.Dialer.DualStack,
+		},
+		Resolver: &helpers.Resolver{
+			LRUCache:  lrucache.NewLRUCache(config.Transport.Dialer.DNSCacheSize),
+			DNSExpiry: time.Duration(config.Transport.Dialer.DNSCacheExpiry) * time.Second,
+			BlackList: lrucache.NewLRUCache(1024),
+		},
+	}
 
-	// d.LoopbackAddrs["127.0.0.1"] = struct{}{}
-	d.LoopbackAddrs["::1"] = struct{}{}
-	if addrs, err := net.InterfaceAddrs(); err == nil {
-		for _, addr := range addrs {
-			switch addr.Network() {
-			case "ip":
-				d.LoopbackAddrs[addr.String()] = struct{}{}
-			}
+	if ips, err := helpers.LocalIPv4s(); err == nil {
+		for _, ip := range ips {
+			d.Resolver.BlackList.Set(ip.String(), struct{}{}, time.Time{})
+		}
+		for _, s := range []string{"127.0.0.1", "::1"} {
+			d.Resolver.BlackList.Set(s, struct{}{}, time.Time{})
 		}
 	}
-	// glog.V(2).Infof("add LoopbackAddrs=%v to direct filter", d.LoopbackAddrs)
+
+	tr := &http.Transport{
+		Dial: d.Dial,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: config.Transport.TLSClientConfig.InsecureSkipVerify,
+			ClientSessionCache: tls.NewLRUClientSessionCache(config.Transport.TLSClientConfig.ClientSessionCacheSize),
+		},
+		TLSHandshakeTimeout: time.Duration(config.Transport.TLSHandshakeTimeout) * time.Second,
+		MaxIdleConnsPerHost: config.Transport.MaxIdleConnsPerHost,
+		DisableCompression:  config.Transport.DisableCompression,
+	}
+
+	if config.Transport.Proxy.Enabled {
+		fixedURL, err := url.Parse(config.Transport.Proxy.URL)
+		if err != nil {
+			glog.Fatalf("url.Parse(%#v) error: %s", config.Transport.Proxy.URL, err)
+		}
+
+		switch fixedURL.Scheme {
+		case "http", "https":
+			tr.Proxy = http.ProxyURL(fixedURL)
+			tr.Dial = nil
+			tr.DialTLS = nil
+		default:
+			dialer, err := proxy.FromURL(fixedURL, d, nil)
+			if err != nil {
+				glog.Fatalf("proxy.FromURL(%#v) error: %s", fixedURL.String(), err)
+			}
+
+			tr.Dial = dialer.Dial
+			tr.DialTLS = nil
+			tr.Proxy = nil
+		}
+	}
 
 	return &Filter{
-		transport: &http.Transport{
-			Dial: d.Dial,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: false,
-				ClientSessionCache: tls.NewLRUClientSessionCache(1000),
-			},
-			TLSHandshakeTimeout: time.Duration(config.Transport.TLSHandshakeTimeout) * time.Second,
-			MaxIdleConnsPerHost: config.Transport.MaxIdleConnsPerHost,
-			DisableCompression:  config.Transport.DisableCompression,
-		},
-		ratelimt: RateLimit{
-			Threshold: int64(config.RateLimit.Threshold),
-			Capacity:  int64(config.RateLimit.Capacity),
-			Rate:      float64(config.RateLimit.Rate),
-		},
+		Config:    *config,
+		transport: tr,
 	}, nil
 }
 
@@ -92,16 +138,16 @@ func (f *Filter) FilterName() string {
 	return filterName
 }
 
-func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Context, *http.Response, error) {
+func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
 	switch req.Method {
 	case "CONNECT":
-		glog.Infof("%s \"DIRECT %s %s %s\" - -", req.RemoteAddr, req.Method, req.Host, req.Proto)
+		glog.V(2).Infof("%s \"DIRECT %s %s %s\" - -", req.RemoteAddr, req.Method, req.Host, req.Proto)
 		rconn, err := f.transport.Dial("tcp", req.Host)
 		if err != nil {
 			return ctx, nil, err
 		}
 
-		rw := ctx.GetResponseWriter()
+		rw := filters.GetResponseWriter(ctx)
 
 		hijacker, ok := rw.(http.Hijacker)
 		if !ok {
@@ -122,47 +168,22 @@ func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Co
 		}
 		defer lconn.Close()
 
-		go httpproxy.IoCopy(rconn, lconn)
-		httpproxy.IoCopy(lconn, rconn)
+		go helpers.IOCopy(rconn, lconn)
+		helpers.IOCopy(lconn, rconn)
 
-		ctx.SetHijacked(true)
-		return ctx, nil, nil
-	case "PRI":
-		//TODO: fix for http2
-		return ctx, nil, nil
+		return ctx, filters.DummyResponse, nil
 	default:
+		helpers.FixRequestURL(req)
 		resp, err := f.transport.RoundTrip(req)
-		if err == ErrLoopbackAddr {
-			http.FileServer(http.Dir(".")).ServeHTTP(ctx.GetResponseWriter(), req)
-			ctx.SetHijacked(true)
-			return ctx, nil, nil
-		}
 
 		if err != nil {
-			glog.Errorf("%s \"DIRECT %s %s %s\" error: %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, err)
-			data := err.Error()
-			resp = &http.Response{
-				Status:        "502 Bad Gateway",
-				StatusCode:    502,
-				Proto:         "HTTP/1.1",
-				ProtoMajor:    1,
-				ProtoMinor:    1,
-				Header:        http.Header{},
-				Request:       req,
-				Close:         true,
-				ContentLength: int64(len(data)),
-				Body:          ioutil.NopCloser(bytes.NewReader([]byte(data))),
-			}
-			err = nil
-		} else {
-			if req.RemoteAddr != "" {
-				glog.Infof("%s \"DIRECT %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
-			}
+			return ctx, nil, err
 		}
-		if f.ratelimt.Rate > 0 && resp.ContentLength > f.ratelimt.Threshold {
-			glog.V(2).Infof("RateLimit %#v rate to %#v", req.URL.String(), f.ratelimt.Rate)
-			resp.Body = httpproxy.NewRateLimitReader(resp.Body, f.ratelimt.Rate, f.ratelimt.Capacity)
+
+		if req.RemoteAddr != "" {
+			glog.V(2).Infof("%s \"DIRECT %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
 		}
+
 		return ctx, resp, err
 	}
 }

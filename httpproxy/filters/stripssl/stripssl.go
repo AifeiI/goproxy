@@ -1,39 +1,58 @@
 package stripssl
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path"
-	"strings"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/golibs/lrucache"
-	"github.com/golang/glog"
-	"github.com/phuslu/goproxy/httpproxy"
-	"github.com/phuslu/goproxy/httpproxy/filters"
+	"github.com/phuslu/glog"
+
+	"../../filters"
+	"../../helpers"
+	"../../storage"
 )
 
 const (
 	filterName string = "stripssl"
 )
 
+type Config struct {
+	RootCA struct {
+		Filename string
+		Dirname  string
+		Name     string
+		Duration int
+		RsaBits  int
+		Portable bool
+	}
+	Ports   []int
+	Ignores []string
+	Sites   []string
+}
+
 type Filter struct {
+	Config
 	CA             *RootCA
-	CAExpires      time.Duration
+	CAExpiry       time.Duration
 	TLSConfigCache lrucache.Cache
-	SiteLists1     map[string]struct{}
-	SiteLists2     []string
+	Ports          map[string]struct{}
+	Ignores        map[string]struct{}
+	Sites          *helpers.HostMatcher
 }
 
 func init() {
 	filename := filterName + ".json"
-	config, err := NewConfig(filters.LookupConfigStoreURI(filterName), filename)
+	config := new(Config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
-		glog.Fatalf("NewConfig(%#v) failed: %s", filename, err)
+		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
 	}
 
 	err = filters.Register(filterName, &filters.RegisteredFilter{
@@ -47,34 +66,39 @@ func init() {
 	}
 }
 
+var (
+	defaultCA *RootCA
+	onceCA    sync.Once
+)
+
 func NewFilter(config *Config) (_ filters.Filter, err error) {
-	var ca *RootCA
-
-	ca, err = NewRootCA(config.RootCA.Name, time.Duration(config.RootCA.Duration)*time.Second, config.RootCA.RsaBits, config.RootCA.Dirname)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := os.Stat(config.RootCA.Dirname); os.IsNotExist(err) {
-		if err = os.Mkdir(config.RootCA.Dirname, 0755); err != nil {
-			return nil, err
+	onceCA.Do(func() {
+		defaultCA, err = NewRootCA(config.RootCA.Name,
+			time.Duration(config.RootCA.Duration)*time.Second,
+			config.RootCA.RsaBits,
+			config.RootCA.Dirname,
+			config.RootCA.Portable)
+		if err != nil {
+			glog.Fatalf("NewRootCA(%#v) error: %v", config.RootCA.Name, err)
 		}
-	}
+	})
 
 	f := &Filter{
-		CA:             ca,
-		CAExpires:      time.Duration(config.RootCA.Duration) * time.Second,
+		Config:         *config,
+		CA:             defaultCA,
+		CAExpiry:       time.Duration(config.RootCA.Duration) * time.Second,
 		TLSConfigCache: lrucache.NewMultiLRUCache(4, 4096),
-		SiteLists1:     make(map[string]struct{}),
-		SiteLists2:     make([]string, 0),
+		Ports:          make(map[string]struct{}),
+		Ignores:        make(map[string]struct{}),
+		Sites:          helpers.NewHostMatcher(config.Sites),
 	}
 
-	for _, site := range config.Sites {
-		if !strings.Contains(site, "*") {
-			f.SiteLists1[site] = struct{}{}
-		} else {
-			f.SiteLists2 = append(f.SiteLists2, site)
-		}
+	for _, port := range config.Ports {
+		f.Ports[strconv.Itoa(port)] = struct{}{}
+	}
+
+	for _, ignore := range config.Ignores {
+		f.Ignores[ignore] = struct{}{}
 	}
 
 	return f, nil
@@ -84,32 +108,35 @@ func (f *Filter) FilterName() string {
 	return filterName
 }
 
-func (f *Filter) Match(host string) bool {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	if _, ok := f.SiteLists1[host]; ok {
-		return true
-	}
-
-	for _, pattern := range f.SiteLists2 {
-		if matched, _ := path.Match(pattern, host); matched {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (f *Filter) Request(ctx *filters.Context, req *http.Request) (*filters.Context, *http.Request, error) {
-	if req.Method != "CONNECT" || !f.Match(req.Host) {
+func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Context, *http.Request, error) {
+	if req.Method != http.MethodConnect {
 		return ctx, req, nil
 	}
 
-	hijacker, ok := ctx.GetResponseWriter().(http.Hijacker)
+	if f1 := filters.GetRoundTripFilter(ctx); f1 != nil {
+		if _, ok := f.Ignores[f1.FilterName()]; ok {
+			return ctx, req, nil
+		}
+	}
+
+	host, port, err := net.SplitHostPort(req.RequestURI)
+	if err != nil {
+		return ctx, req, nil
+	}
+
+	if !f.Sites.Match(host) {
+		return ctx, req, nil
+	}
+
+	needStripSSL := true
+	if _, ok := f.Ports[port]; !ok {
+		needStripSSL = false
+	}
+
+	rw := filters.GetResponseWriter(ctx)
+	hijacker, ok := rw.(http.Hijacker)
 	if !ok {
-		return ctx, nil, fmt.Errorf("%#v does not implments Hijacker", ctx.GetResponseWriter())
+		return ctx, nil, fmt.Errorf("%#v does not implments Hijacker", rw)
 	}
 
 	conn, _, err := hijacker.Hijack()
@@ -123,38 +150,41 @@ func (f *Filter) Request(ctx *filters.Context, req *http.Request) (*filters.Cont
 		return ctx, nil, err
 	}
 
-	glog.Infof("%s \"STRIP %s %s %s\" - -", req.RemoteAddr, req.Method, req.Host, req.Proto)
+	glog.V(2).Infof("%s \"STRIP %s %s %s\" - -", req.RemoteAddr, req.Method, req.Host, req.Proto)
 
-	config, err := f.issue(req.Host)
+	var c net.Conn = conn
+	if needStripSSL {
+		config, err := f.issue(req.Host)
+		if err != nil {
+			conn.Close()
+			return ctx, nil, err
+		}
+
+		tlsConn := tls.Server(conn, config)
+
+		if err := tlsConn.Handshake(); err != nil {
+			glog.V(2).Infof("%s %T.Handshake() error: %#v", req.RemoteAddr, tlsConn, err)
+			conn.Close()
+			return ctx, nil, err
+		}
+
+		c = tlsConn
+	}
+
+	if ln1, ok := filters.GetListener(ctx).(helpers.Listener); ok {
+		ln1.Add(c)
+		return ctx, filters.DummyRequest, nil
+	}
+
+	loConn, err := net.Dial("tcp", filters.GetListener(ctx).Addr().String())
 	if err != nil {
-		conn.Close()
 		return ctx, nil, err
 	}
 
-	tlsConn := tls.Server(conn, config)
+	go helpers.IOCopy(loConn, c)
+	go helpers.IOCopy(c, loConn)
 
-	if err := tlsConn.Handshake(); err != nil {
-		glog.V(2).Infof("%s %T.Handshake() error: %#v", req.RemoteAddr, tlsConn, err)
-		conn.Close()
-		return ctx, nil, err
-	}
-
-	if ln1, ok := ctx.GetListener().(httpproxy.Listener); ok {
-		ln1.Add(tlsConn)
-		ctx.SetHijacked(true)
-		return ctx, nil, nil
-	}
-
-	loConn, err := net.Dial("tcp", ctx.GetListener().Addr().String())
-	if err != nil {
-		return ctx, nil, err
-	}
-
-	go httpproxy.IoCopy(loConn, tlsConn)
-	go httpproxy.IoCopy(tlsConn, loConn)
-
-	ctx.SetHijacked(true)
-	return ctx, nil, nil
+	return ctx, filters.DummyRequest, nil
 }
 
 func (f *Filter) issue(host string) (_ *tls.Config, err error) {
@@ -167,14 +197,14 @@ func (f *Filter) issue(host string) (_ *tls.Config, err error) {
 	var config interface{}
 	var ok bool
 	if config, ok = f.TLSConfigCache.Get(name); !ok {
-		cert, err := f.CA.Issue(name, f.CAExpires, f.CA.RsaBits())
+		cert, err := f.CA.Issue(name, f.CAExpiry, f.CA.RsaBits())
 		if err != nil {
 			return nil, err
 		}
 		config = &tls.Config{
 			Certificates: []tls.Certificate{*cert},
 		}
-		f.TLSConfigCache.Set(name, config, time.Now().Add(f.CAExpires))
+		f.TLSConfigCache.Set(name, config, time.Now().Add(f.CAExpiry))
 	}
 	return config.(*tls.Config), nil
 }

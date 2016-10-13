@@ -1,27 +1,65 @@
 package autoproxy
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/base64"
-	"io"
+	"context"
 	"io/ioutil"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/phuslu/goproxy/httpproxy"
-	"github.com/phuslu/goproxy/httpproxy/filters"
-	"github.com/phuslu/goproxy/storage"
+	"github.com/cloudflare/golibs/lrucache"
+	"github.com/phuslu/glog"
+	"github.com/wangtuanjie/ip17mon"
+
+	"../../filters"
+	"../../helpers"
+	"../../storage"
 )
 
 const (
-	filterName      string = "autoproxy"
-	placeholderPath string = "/proxy.pac"
+	filterName string = "autoproxy"
 )
+
+type Config struct {
+	SiteFilters struct {
+		Enabled bool
+		Rules   map[string]string
+	}
+	RegionFilters struct {
+		Enabled      bool
+		DataFile     string
+		DNSServer    string
+		DNSCacheSize int
+		Rules        map[string]string
+	}
+	IndexFiles struct {
+		Enabled bool
+		Files   []string
+	}
+	GFWList struct {
+		Enabled  bool
+		URL      string
+		File     string
+		Encoding string
+		Expiry   int
+		Duration int
+	}
+	MobileConfig struct {
+		Enabled bool
+	}
+	IPHTML struct {
+		Enabled   bool
+		WhiteList []string
+	}
+	BlackList struct {
+		Enabled   bool
+		SiteRules []string
+	}
+}
 
 var (
 	onceUpdater sync.Once
@@ -31,23 +69,40 @@ type GFWList struct {
 	URL      *url.URL
 	Filename string
 	Encoding string
+	Expiry   time.Duration
 	Duration time.Duration
 }
 
 type Filter struct {
-	Store         storage.Store
-	Sites         *httpproxy.HostMatcher
-	GFWList       *GFWList
-	AutoProxy2Pac *AutoProxy2Pac
-	Transport     *http.Transport
-	UpdateChan    chan struct{}
+	Config
+	Store                storage.Store
+	IndexFilesEnabled    bool
+	IndexFiles           []string
+	IndexFilesSet        map[string]struct{}
+	ProxyPacCache        lrucache.Cache
+	GFWListEnabled       bool
+	GFWList              *GFWList
+	MobileConfigEnabled  bool
+	IPHTMLEnabled        bool
+	IPHTMLWhiteList      *helpers.HostMatcher
+	BlackListEnabled     bool
+	BlackListSiteMatcher *helpers.HostMatcher
+	SiteFiltersEnabled   bool
+	SiteFiltersRules     *helpers.HostMatcher
+	RegionFiltersEnabled bool
+	RegionFiltersRules   map[string]filters.RoundTripFilter
+	RegionResolver       *helpers.Resolver
+	RegionLocator        *ip17mon.Locator
+	RegionFilterCache    lrucache.Cache
+	Transport            *http.Transport
 }
 
 func init() {
 	filename := filterName + ".json"
-	config, err := NewConfig(filters.LookupConfigStoreURI(filterName), filename)
+	config := new(Config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
-		glog.Fatalf("NewConfig(%#v) failed: %s", filename, err)
+		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
 	}
 
 	err = filters.Register(filterName, &filters.RegisteredFilter{
@@ -59,6 +114,9 @@ func init() {
 	if err != nil {
 		glog.Fatalf("Register(%#v) error: %s", filterName, err)
 	}
+
+	mime.AddExtensionType(".crt", "application/x-x509-ca-cert")
+	mime.AddExtensionType(".mobileconfig", "application/x-apple-aspen-config")
 }
 
 func NewFilter(config *Config) (_ filters.Filter, err error) {
@@ -66,62 +124,110 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 
 	gfwlist.Encoding = config.GFWList.Encoding
 	gfwlist.Filename = config.GFWList.File
+	gfwlist.Expiry = time.Duration(config.GFWList.Expiry) * time.Second
 	gfwlist.Duration = time.Duration(config.GFWList.Duration) * time.Second
 	gfwlist.URL, err = url.Parse(config.GFWList.URL)
 	if err != nil {
 		return nil, err
 	}
 
-	store, err := storage.OpenURI(filters.LookupConfigStoreURI(filterName))
+	store := storage.LookupStoreByFilterName(filterName)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := store.HeadObject(gfwlist.Filename); err != nil {
+	if _, err := store.Head(gfwlist.Filename); err != nil {
 		return nil, err
 	}
 
-	autoproxy2pac := &AutoProxy2Pac{
-		Sites: config.Sites,
-	}
-
-	object, err := store.GetObject(gfwlist.Filename, -1, -1)
-	if err != nil {
-		return nil, err
-	}
-
-	rc := object.Body()
-	defer rc.Close()
-
-	var r io.Reader
-	br := bufio.NewReader(rc)
-	if data, err := br.Peek(20); err == nil {
-		if bytes.HasPrefix(data, []byte("[AutoProxy ")) {
-			r = br
-		} else {
-			r = base64.NewDecoder(base64.StdEncoding, br)
-		}
-	}
-
-	err = autoproxy2pac.Read(r)
-	if err != nil {
-		return nil, err
-	}
-
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-	}
+	transport := &http.Transport{}
 
 	f := &Filter{
-		Store:         store,
-		Sites:         httpproxy.NewHostMatcher(config.Sites),
-		GFWList:       &gfwlist,
-		AutoProxy2Pac: autoproxy2pac,
-		Transport:     transport,
-		UpdateChan:    make(chan struct{}),
+		Config:               *config,
+		Store:                store,
+		IndexFilesEnabled:    config.IndexFiles.Enabled,
+		IndexFiles:           config.IndexFiles.Files,
+		IndexFilesSet:        make(map[string]struct{}),
+		ProxyPacCache:        lrucache.NewLRUCache(32),
+		GFWListEnabled:       config.GFWList.Enabled,
+		MobileConfigEnabled:  config.MobileConfig.Enabled,
+		IPHTMLEnabled:        config.IPHTML.Enabled,
+		BlackListEnabled:     config.BlackList.Enabled,
+		BlackListSiteMatcher: helpers.NewHostMatcher(config.BlackList.SiteRules),
+		GFWList:              &gfwlist,
+		Transport:            transport,
+		SiteFiltersEnabled:   config.SiteFilters.Enabled,
+		RegionFiltersEnabled: config.RegionFilters.Enabled,
 	}
 
-	go onceUpdater.Do(f.updater)
+	for _, name := range f.IndexFiles {
+		f.IndexFilesSet[name] = struct{}{}
+	}
+
+	if f.IPHTMLEnabled {
+		f.IPHTMLWhiteList = helpers.NewHostMatcher(config.IPHTML.WhiteList)
+	}
+
+	if f.SiteFiltersEnabled {
+		fm := make(map[string]interface{})
+		for host, name := range config.SiteFilters.Rules {
+			f, err := filters.GetFilter(name)
+			if err != nil {
+				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) for %#v error: %v", name, host, err)
+			}
+			if _, ok := f.(filters.RoundTripFilter); !ok {
+				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) return %T, not a RoundTripFilter", name, f)
+			}
+			fm[host] = f
+		}
+		f.SiteFiltersRules = helpers.NewHostMatcherWithValue(fm)
+	}
+
+	if f.RegionFiltersEnabled {
+		resp, err := store.Get(f.Config.RegionFilters.DataFile)
+		if err != nil {
+			glog.Fatalf("AUTOPROXY: store.Get(%#v) error: %v", f.Config.RegionFilters.DataFile, err)
+		}
+		defer resp.Body.Close()
+
+		data, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			glog.Fatalf("AUTOPROXY: ioutil.ReadAll(%#v) error: %v", resp.Body, err)
+		}
+
+		f.RegionLocator = ip17mon.NewLocatorWithData(data)
+
+		f.RegionResolver = &helpers.Resolver{}
+		if config.RegionFilters.DNSServer != "" {
+			f.RegionResolver.DNSServer = net.ParseIP(config.RegionFilters.DNSServer)
+			if f.RegionResolver.DNSServer == nil {
+				glog.Fatalf("AUTOPROXY: net.ParseIP(%+v) failed", config.RegionFilters.DNSServer)
+			}
+		}
+
+		fm := make(map[string]filters.RoundTripFilter)
+		for region, name := range config.RegionFilters.Rules {
+			if name == "" {
+				continue
+			}
+			f, err := filters.GetFilter(name)
+			if err != nil {
+				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) for %#v error: %v", name, region, err)
+			}
+			f1, ok := f.(filters.RoundTripFilter)
+			if !ok {
+				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) return %T, not a RoundTripFilter", name, f)
+			}
+			fm[strings.ToLower(region)] = f1
+		}
+		f.RegionFiltersRules = fm
+
+		f.RegionFilterCache = lrucache.NewLRUCache(uint(f.Config.RegionFilters.DNSCacheSize))
+	}
+
+	if f.GFWListEnabled {
+		go onceUpdater.Do(f.pacUpdater)
+	}
 
 	return f, nil
 }
@@ -130,118 +236,116 @@ func (f *Filter) FilterName() string {
 	return filterName
 }
 
-func (f *Filter) updater() {
-	glog.V(2).Infof("start updater for %#v", f.GFWList)
+func (f *Filter) FindCountryByIP(ip string) (string, error) {
+	li, err := f.RegionLocator.Find(ip)
+	if err != nil {
+		return "", err
+	}
 
-	ticker := time.Tick(10 * time.Minute)
-
-	for {
-		needUpdate := false
-
-		select {
-		case <-f.UpdateChan:
-			glog.Infof("Begin manual gfwlist(%#v) update...", f.GFWList.URL.String())
-			needUpdate = true
-		case <-ticker:
-			break
-		}
-
-		if !needUpdate {
-			h, err := f.Store.HeadObject(f.GFWList.Filename)
-			if err != nil {
-				glog.Warningf("stat gfwlist(%#v) err: %v", f.GFWList.Filename, err)
-				continue
-			}
-
-			lm := h.Get("Last-Modified")
-			if lm == "" {
-				glog.Warningf("gfwlist(%#v) header(%#v) does not contains last-modified", f.GFWList.Filename, h)
-				continue
-			}
-
-			modTime, err := time.Parse(f.Store.DateFormat(), lm)
-			if err != nil {
-				glog.Warningf("stat gfwlist(%#v) has parse %#v error: %v", f.GFWList.Filename, lm, err)
-				continue
-			}
-
-			needUpdate = time.Now().After(modTime.Add(f.GFWList.Duration))
-		}
-
-		if needUpdate {
-			req, err := http.NewRequest("GET", f.GFWList.URL.String(), nil)
-			if err != nil {
-				glog.Warningf("NewRequest(%#v) error: %v", f.GFWList.URL.String(), err)
-				continue
-			}
-
-			glog.Infof("Downloading %#v", f.GFWList.URL.String())
-
-			resp, err := f.Transport.RoundTrip(req)
-			if err != nil {
-				glog.Warningf("%T.RoundTrip(%#v) error: %v", f.Transport, f.GFWList.URL.String(), err)
-				continue
-			}
-
-			var r io.Reader = resp.Body
-			switch f.GFWList.Encoding {
-			case "base64":
-				r = base64.NewDecoder(base64.StdEncoding, r)
-			default:
-				break
-			}
-
-			data, err := ioutil.ReadAll(r)
-			if err != nil {
-				glog.Warningf("ReadAll(%#v) error: %v", r, err)
-				resp.Body.Close()
-				continue
-			}
-
-			err = f.Store.DeleteObject(f.GFWList.Filename)
-			if err != nil {
-				glog.Warningf("%T.DeleteObject(%#v) error: %v", f.Store, f.GFWList.Filename, err)
-				continue
-			}
-
-			err = f.Store.PutObject(f.GFWList.Filename, http.Header{}, ioutil.NopCloser(bytes.NewReader(data)))
-			if err != nil {
-				glog.Warningf("%T.PutObject(%#v) error: %v", f.Store, f.GFWList.Filename, err)
-				continue
-			}
-
-			glog.Infof("Update %#v from %#v OK", f.GFWList.Filename, f.GFWList.URL.String())
-			resp.Body.Close()
+	//FIXME: Who should be ashamed?
+	switch li.Country {
+	case "中国":
+		switch li.Region {
+		case "台湾", "香港":
+			li.Country = li.Region
 		}
 	}
+
+	return li.Country, nil
 }
 
-func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Context, *http.Response, error) {
-
-	if !strings.HasPrefix(req.RequestURI, placeholderPath) {
-		return ctx, nil, nil
+func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Context, *http.Request, error) {
+	if strings.HasPrefix(req.RequestURI, "/") {
+		return ctx, req, nil
 	}
 
-	if strings.Contains(req.URL.Query().Encode(), "flush") {
-		f.UpdateChan <- struct{}{}
+	host := helpers.GetHostName(req)
+
+	if f.BlackListEnabled {
+		if f.BlackListSiteMatcher.Match(host) {
+			glog.V(2).Infof("%s \"AUTOPROXY BlackList %s %s %s\"", req.RemoteAddr, req.Method, req.URL.String(), req.Proto)
+			return ctx, filters.DummyRequest, nil
+		}
 	}
 
-	data := f.AutoProxy2Pac.GeneratePac(req)
-
-	resp := &http.Response{
-		Status:        "200 OK",
-		StatusCode:    200,
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        http.Header{},
-		Request:       req,
-		Close:         true,
-		ContentLength: int64(len(data)),
-		Body:          ioutil.NopCloser(bytes.NewReader([]byte(data))),
+	if f.SiteFiltersEnabled {
+		if f1, ok := f.SiteFiltersRules.Lookup(host); ok {
+			glog.V(2).Infof("%s \"AUTOPROXY SiteFilters %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
+			filters.SetRoundTripFilter(ctx, f1.(filters.RoundTripFilter))
+			return ctx, req, nil
+		}
 	}
 
-	glog.Infof("%s \"AUTOPROXY %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.RequestURI, req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
+	if f.RegionFiltersEnabled {
+		if f1, ok := f.RegionFilterCache.Get(host); ok {
+			if f1 != nil {
+				filters.SetRoundTripFilter(ctx, f1.(filters.RoundTripFilter))
+			}
+		} else if ips, err := f.RegionResolver.LookupIP(host); err == nil && len(ips) > 0 {
+			ip := ips[0]
 
-	return ctx, resp, nil
+			if ip.IsLoopback() && !(strings.Contains(host, ".local") || strings.Contains(host, "localhost.")) {
+				glog.V(2).Infof("%s \"AUTOPROXY RegionFilters BYPASS Loopback %s %s %s\" with nil", req.RemoteAddr, req.Method, req.URL.String(), req.Proto)
+				f.RegionFilterCache.Set(host, nil, time.Now().Add(time.Hour))
+			} else if ip.To4() == nil {
+				if f1, ok := f.RegionFiltersRules["ipv6"]; ok {
+					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters IPv6 %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
+					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
+					filters.SetRoundTripFilter(ctx, f1)
+				}
+			} else if country, err := f.FindCountryByIP(ip.String()); err == nil {
+				if f1, ok := f.RegionFiltersRules[country]; ok {
+					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters %s %s %s %s\" with %T", req.RemoteAddr, country, req.Method, req.URL.String(), req.Proto, f1)
+					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
+					filters.SetRoundTripFilter(ctx, f1)
+				} else if f1, ok := f.RegionFiltersRules["default"]; ok {
+					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters Default %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
+					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
+					filters.SetRoundTripFilter(ctx, f1)
+				} else {
+					f.RegionFilterCache.Set(host, nil, time.Now().Add(time.Hour))
+				}
+			}
+		}
+	}
+
+	return ctx, req, nil
+}
+
+func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
+	if f := filters.GetRoundTripFilter(ctx); f != nil {
+		return f.RoundTrip(ctx, req)
+	}
+
+	switch {
+	case f.SiteFiltersEnabled && req.URL.Scheme == "https":
+		if f1, ok := f.SiteFiltersRules.Lookup(helpers.GetHostName(req)); ok && f1 != nil {
+			return f1.(filters.RoundTripFilter).RoundTrip(ctx, req)
+		}
+	case f.RegionFiltersEnabled && req.URL.Scheme == "https":
+		if f1, ok := f.RegionFilterCache.Get(helpers.GetHostName(req)); ok && f1 != nil {
+			return f1.(filters.RoundTripFilter).RoundTrip(ctx, req)
+		}
+	}
+
+	if req.URL.Host == "" && req.RequestURI[0] == '/' && f.IndexFilesEnabled {
+		if _, ok := f.IndexFilesSet[req.URL.Path[1:]]; ok || req.URL.Path == "/" {
+			switch {
+			case f.GFWListEnabled && strings.HasSuffix(req.URL.Path, ".pac"):
+				glog.V(2).Infof("%s \"AUTOPROXY ProxyPac %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+				return f.ProxyPacRoundTrip(ctx, req)
+			case f.MobileConfigEnabled && strings.HasSuffix(req.URL.Path, ".mobileconfig"):
+				glog.V(2).Infof("%s \"AUTOPROXY ProxyMobileConfig %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+				return f.ProxyMobileConfigRoundTrip(ctx, req)
+			case f.IPHTMLEnabled && req.URL.Path == "/ip.html":
+				glog.V(2).Infof("%s \"AUTOPROXY IPHTML %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+				return f.IPHTMLRoundTrip(ctx, req)
+			default:
+				glog.V(2).Infof("%s \"AUTOPROXY IndexFiles %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+				return f.IndexFilesRoundTrip(ctx, req)
+			}
+		}
+	}
+
+	return ctx, nil, nil
 }

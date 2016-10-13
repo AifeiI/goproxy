@@ -1,6 +1,7 @@
 package stripssl
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -9,17 +10,23 @@ import (
 	"encoding/pem"
 	"io/ioutil"
 	"math/big"
+	"net"
+	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/phuslu/glog"
+
+	"../../helpers"
+	"../../storage"
 )
 
 type RootCA struct {
+	store    storage.Store
 	name     string
 	keyFile  string
 	certFile string
@@ -32,11 +39,19 @@ type RootCA struct {
 	derBytes []byte
 }
 
-func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string) (*RootCA, error) {
+func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string, portable bool) (*RootCA, error) {
 	keyFile := name + ".key"
 	certFile := name + ".crt"
 
+	var store storage.Store
+	if portable {
+		store = &storage.FileStore{filepath.Dir(os.Args[0])}
+	} else {
+		store = &storage.FileStore{"."}
+	}
+
 	rootCA := &RootCA{
+		store:    store,
 		name:     name,
 		keyFile:  keyFile,
 		certFile: certFile,
@@ -45,20 +60,32 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string)
 		mu:       new(sync.Mutex),
 	}
 
-	if _, err := os.Stat(certFile); os.IsNotExist(err) {
-		glog.Infof("Generating RootCA for %s", certFile)
+	if storage.NotExist(store, certFile) {
+		glog.Infof("Generating RootCA for %s/%s", keyFile, certFile)
 		template := x509.Certificate{
 			IsCA:         true,
 			SerialNumber: big.NewInt(1),
 			Subject: pkix.Name{
+				CommonName:   name,
+				Country:      []string{"US"},
+				Province:     []string{"California"},
+				Locality:     []string{"Los Angeles"},
 				Organization: []string{name},
+				ExtraNames: []pkix.AttributeTypeAndValue{
+					{
+						Type:  []int{2, 5, 4, 42},
+						Value: name,
+					},
+				},
 			},
-			NotBefore: time.Now().Add(-time.Duration(5 * time.Minute)),
+			NotBefore: time.Now().Add(-time.Duration(30 * 24 * time.Hour)),
 			NotAfter:  time.Now().Add(vaildFor),
 
 			KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 			BasicConstraintsValid: true,
+			// AuthorityKeyId:        sha1.New().Sum([]byte("phuslu")),
+			// SubjectKeyId:          sha1.New().Sum([]byte("phuslu")),
 		}
 
 		priv, err := rsa.GenerateKey(rand.Reader, rsaBits)
@@ -80,97 +107,82 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string)
 		rootCA.priv = priv
 		rootCA.derBytes = derBytes
 
-		outFile1, err := os.Create(keyFile)
-		if err != nil {
+		keypem := &pem.Block{Type: "PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rootCA.priv)}
+		rc := ioutil.NopCloser(bytes.NewReader(pem.EncodeToMemory(keypem)))
+		if _, err = store.Put(keyFile, http.Header{}, rc); err != nil {
 			return nil, err
 		}
-		pem.Encode(outFile1, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rootCA.priv)})
-		outFile1.Close()
 
-		outFile2, err := os.Create(certFile)
-		if err != nil {
+		certpem := &pem.Block{Type: "CERTIFICATE", Bytes: rootCA.derBytes}
+		rc = ioutil.NopCloser(bytes.NewReader(pem.EncodeToMemory(certpem)))
+		if _, err = store.Put(certFile, http.Header{}, rc); err != nil {
 			return nil, err
 		}
-		pem.Encode(outFile2, &pem.Block{Type: "CERTIFICATE", Bytes: rootCA.derBytes})
-		outFile2.Close()
+	} else {
+		for _, name := range []string{keyFile, certFile} {
+			resp, err := store.Get(name)
+			if err != nil {
+				return nil, err
+			}
 
-		cmds := make([]*exec.Cmd, 0)
-		switch runtime.GOOS {
-		case "windows":
-			cmds = append(cmds, exec.Command("certmgr.exe", "-del", "-c", "-n", name, "-s", "-r", "localMachine", "root"))
-			cmds = append(cmds, exec.Command("certmgr.exe", "-add", "-c", certFile, "-s", "-r", "localMachine", "root"))
-		case "darwin":
-			cmds = append(cmds, exec.Command("security", "add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", certFile))
-		default:
-			break
+			data, err := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+
+			var b *pem.Block
+			for {
+				b, data = pem.Decode(data)
+				if b == nil {
+					break
+				}
+				switch b.Type {
+				case "CERTIFICATE":
+					rootCA.derBytes = b.Bytes
+					ca, err := x509.ParseCertificate(rootCA.derBytes)
+					if err != nil {
+						return nil, err
+					}
+					rootCA.ca = ca
+				case "PRIVATE KEY", "PRIVATE RSA KEY":
+					priv, err := x509.ParsePKCS1PrivateKey(b.Bytes)
+					if err != nil {
+						return nil, err
+					}
+					rootCA.priv = priv
+				}
+			}
 		}
+	}
 
-		for _, cmd := range cmds {
-			if err := cmd.Run(); err != nil {
-				glog.Errorf("Import RootCA(%#v) error: %v", cmd.Args, err)
+	switch runtime.GOOS {
+	case "windows", "darwin":
+		if _, err := rootCA.ca.Verify(x509.VerifyOptions{}); err != nil {
+			glog.Warningf("Verify RootCA(%#v) error: %v, try import to system root", name, err)
+			if err = helpers.RemoveCAFromSystemRoot(rootCA.name); err != nil {
+				glog.Errorf("Remove Old RootCA(%#v) error: %v", name, err)
+			}
+			if err = helpers.ImportCAToSystemRoot(rootCA.ca); err != nil {
+				glog.Errorf("Import RootCA(%#v) error: %v", name, err)
 			} else {
 				glog.Infof("Import RootCA(%s) OK", certFile)
 			}
-		}
 
-		if fis, err := ioutil.ReadDir(certDir); err == nil {
-			for _, fi := range fis {
-				if err = os.Remove(certDir + "/" + fi.Name()); err != nil {
-					glog.Errorf("Remove(%#v) error: %v", fi.Name(), err)
+			if fs, err := store.List(certDir); err == nil {
+				for _, f := range fs {
+					if _, err = store.Delete(f); err != nil {
+						glog.Errorf("%T.Delete(%#v) error: %v", store, f, err)
+					}
 				}
 			}
 		}
-	} else {
-		data, err := ioutil.ReadFile(keyFile)
-		if err != nil {
-			return nil, err
-		}
+	}
 
-		var b *pem.Block
-		for {
-			b, data = pem.Decode(data)
-			if b == nil {
-				break
-			}
-			if b.Type == "CERTIFICATE" {
-				rootCA.derBytes = b.Bytes
-				ca, err := x509.ParseCertificate(rootCA.derBytes)
-				if err != nil {
-					return nil, err
-				}
-				rootCA.ca = ca
-			} else if b.Type == "RSA PRIVATE KEY" {
-				priv, err := x509.ParsePKCS1PrivateKey(b.Bytes)
-				if err != nil {
-					return nil, err
-				}
-				rootCA.priv = priv
-			}
-		}
-
-		data, err = ioutil.ReadFile(certFile)
-		if err != nil {
-			return nil, err
-		}
-
-		for {
-			b, data = pem.Decode(data)
-			if b == nil {
-				break
-			}
-			if b.Type == "CERTIFICATE" {
-				rootCA.derBytes = b.Bytes
-				ca, err := x509.ParseCertificate(rootCA.derBytes)
-				if err != nil {
-					return nil, err
-				}
-				rootCA.ca = ca
-			} else if b.Type == "RSA PRIVATE KEY" {
-				priv, err := x509.ParsePKCS1PrivateKey(b.Bytes)
-				if err != nil {
-					return nil, err
-				}
-				rootCA.priv = priv
+	if fs, ok := store.(*storage.FileStore); ok {
+		if storage.NotExist(store, certDir) {
+			if err := os.Mkdir(filepath.Join(fs.Dirname, certDir), 0777); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -213,7 +225,7 @@ func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) e
 		PublicKey:          csr.PublicKey,
 		SerialNumber:       big.NewInt(time.Now().UnixNano()),
 		SignatureAlgorithm: x509.SHA256WithRSA,
-		NotBefore:          time.Now().Add(-time.Duration(10 * time.Minute)).UTC(),
+		NotBefore:          time.Now().Add(-time.Duration(30 * 24 * time.Hour)),
 		NotAfter:           time.Now().Add(vaildFor),
 		KeyUsage:           x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage: []x509.ExtKeyUsage{
@@ -227,18 +239,26 @@ func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) e
 		return err
 	}
 
-	outFile, err := os.Create(certFile)
-	defer outFile.Close()
-	if err != nil {
+	b := new(bytes.Buffer)
+	pem.Encode(b, &pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+	pem.Encode(b, &pem.Block{Type: "PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	if _, err = c.store.Put(certFile, http.Header{}, ioutil.NopCloser(b)); err != nil {
 		return err
 	}
-	pem.Encode(outFile, &pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
-	pem.Encode(outFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
 
 	return nil
 }
 
 func GetCommonName(domain string) string {
+	if ip := net.ParseIP(domain); ip != nil {
+		if ip.To4() == nil {
+			return strings.Replace(ip.String(), ":", "-", -1)
+		} else {
+			return domain
+		}
+	}
+
 	parts := strings.Split(domain, ".")
 	switch len(parts) {
 	case 1, 2:
@@ -270,18 +290,29 @@ func (c *RootCA) toFilename(commonName, suffix string) string {
 func (c *RootCA) Issue(commonName string, vaildFor time.Duration, rsaBits int) (*tls.Certificate, error) {
 	certFile := c.toFilename(commonName, ".crt")
 
-	if _, err := os.Stat(certFile); os.IsNotExist(err) {
-		glog.Infof("Issue %s certificate for %#v...", c.name, commonName)
+	if storage.NotExist(c.store, certFile) {
+		glog.V(2).Infof("Issue %s certificate for %#v...", c.name, commonName)
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if _, err := os.Stat(certFile); os.IsNotExist(err) {
-			if err = c.issue(commonName, vaildFor, rsaBits); err != nil {
+		if storage.NotExist(c.store, certFile) {
+			if err := c.issue(commonName, vaildFor, rsaBits); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	tlsCert, err := tls.LoadX509KeyPair(certFile, certFile)
+	resp, err := c.store.Get(certFile)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCert, err := tls.X509KeyPair(data, data)
 	if err != nil {
 		return nil, err
 	}

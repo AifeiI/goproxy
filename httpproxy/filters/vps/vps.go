@@ -1,6 +1,7 @@
 package vps
 
 import (
+	"context"
 	// "fmt"
 	"math/rand"
 	"net/http"
@@ -8,26 +9,38 @@ import (
 	"path"
 	"strings"
 
-	"github.com/golang/glog"
-	"github.com/phuslu/goproxy/httpproxy"
-	"github.com/phuslu/goproxy/httpproxy/filters"
-	"github.com/phuslu/http2"
+	"github.com/phuslu/glog"
+	"github.com/phuslu/net/http2"
+
+	"../../filters"
+	"../../helpers"
+	"../../storage"
 )
 
 const (
 	filterName string = "vps"
 )
 
+type Config struct {
+	Servers []struct {
+		URL       string
+		Username  string
+		Password  string
+		SSLVerify bool
+	}
+}
+
 type Filter struct {
-	FetchServers []*FetchServer
-	Sites        *httpproxy.HostMatcher
+	Servers []*Server
+	Sites   *helpers.HostMatcher
 }
 
 func init() {
 	filename := filterName + ".json"
-	config, err := NewConfig(filters.LookupConfigStoreURI(filterName), filename)
+	config := new(Config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
-		glog.Fatalf("NewConfig(%#v) failed: %s", filename, err)
+		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
 	}
 
 	err = filters.Register(filterName, &filters.RegisteredFilter{
@@ -42,21 +55,16 @@ func init() {
 }
 
 func NewFilter(config *Config) (filters.Filter, error) {
-	fetchServers := make([]*FetchServer, 0)
-	for _, fs := range config.FetchServers {
+	servers := make([]*Server, 0)
+	for _, fs := range config.Servers {
 		u, err := url.Parse(fs.URL)
 		if err != nil {
 			return nil, err
 		}
 
-		transport := &http2.Transport{
-			InsecureTLSDial: true,
-			Proxy: func(req *http.Request) (*url.URL, error) {
-				return u, nil
-			},
-		}
+		transport := &http2.Transport{}
 
-		fs := &FetchServer{
+		fs := &Server{
 			URL:       u,
 			Username:  fs.Username,
 			Password:  fs.Password,
@@ -64,12 +72,11 @@ func NewFilter(config *Config) (filters.Filter, error) {
 			Transport: transport,
 		}
 
-		fetchServers = append(fetchServers, fs)
+		servers = append(servers, fs)
 	}
 
 	return &Filter{
-		FetchServers: fetchServers,
-		Sites:        httpproxy.NewHostMatcher(config.Sites),
+		Servers: servers,
 	}, nil
 }
 
@@ -77,41 +84,37 @@ func (p *Filter) FilterName() string {
 	return filterName
 }
 
-func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Context, *http.Response, error) {
-	if !f.Sites.Match(req.Host) {
-		return ctx, nil, nil
-	}
-
+func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
 	i := 0
 	switch path.Ext(req.URL.Path) {
 	case ".jpg", ".png", ".webp", ".bmp", ".gif", ".flv", ".mp4":
-		i = rand.Intn(len(f.FetchServers))
+		i = rand.Intn(len(f.Servers))
 	case "":
 		name := path.Base(req.URL.Path)
 		if strings.Contains(name, "play") ||
 			strings.Contains(name, "video") {
-			i = rand.Intn(len(f.FetchServers))
+			i = rand.Intn(len(f.Servers))
 		}
 	default:
-		if strings.Contains(req.URL.Host, "img.") ||
-			strings.Contains(req.URL.Host, "cache.") ||
-			strings.Contains(req.URL.Host, "video.") ||
-			strings.Contains(req.URL.Host, "static.") ||
-			strings.HasPrefix(req.URL.Host, "img") ||
+		if strings.Contains(req.Host, "img.") ||
+			strings.Contains(req.Host, "cache.") ||
+			strings.Contains(req.Host, "video.") ||
+			strings.Contains(req.Host, "static.") ||
+			strings.HasPrefix(req.Host, "img") ||
 			strings.HasPrefix(req.URL.Path, "/static") ||
 			strings.HasPrefix(req.URL.Path, "/asset") ||
 			strings.Contains(req.URL.Path, "min.js") ||
 			strings.Contains(req.URL.Path, "static") ||
 			strings.Contains(req.URL.Path, "asset") ||
 			strings.Contains(req.URL.Path, "/cache/") {
-			i = rand.Intn(len(f.FetchServers))
+			i = rand.Intn(len(f.Servers))
 		}
 	}
 
-	fetchServer := f.FetchServers[i]
+	server := f.Servers[i]
 
 	// if req.Method == "CONNECT" {
-	// 	rconn, err := fetchServer.Transport.Connect(req)
+	// 	rconn, err := server.Transport.Connect(req)
 	// 	if err != nil {
 	// 		return ctx, nil, err
 	// 	}
@@ -138,17 +141,17 @@ func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Co
 	// 	}
 	// 	defer lconn.Close()
 
-	// 	go httpproxy.IoCopy(rconn, lconn)
-	// 	httpproxy.IoCopy(lconn, rconn)
+	// 	go helpers.IOCopy(rconn, lconn)
+	// 	helpers.IOCopy(lconn, rconn)
 
-	// 	ctx.SetHijacked(true)
+	// 	ctx.Hijack(true)
 	// 	return ctx, nil, nil
 	// }
-	resp, err := fetchServer.RoundTrip(req)
+	resp, err := server.RoundTrip(req)
 	if err != nil {
 		return ctx, nil, err
 	} else {
-		glog.Infof("%s \"VPS %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
+		glog.V(2).Infof("%s \"VPS %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
 	}
 	return ctx, resp, err
 }

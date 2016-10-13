@@ -1,13 +1,27 @@
 {
-	"fetchservers": [
+	"Servers": [
 		{
-			"url": "http://yourapp.com/",
-			"password": "123456",
-			"sslverify": false
+			"URL": "https://example.com/",
+			"Password": "123456",
+			"SSLVerify": false,
+			"Host": "",
 		}
 	],
-	"sites": [
-		"*"
-	],
-	"transport": "direct"
+	"Transport": {
+		"Dialer": {
+			"Timeout": 10,
+			"KeepAlive": 180,
+			"DualStack": false,
+			"DNSCacheExpiry": 3600,
+			"DNSCacheSize": 8192
+		},
+		"Proxy": {
+			"Enabled": false,
+			"URL": "http://127.0.0.1:8087",
+		},
+		"DisableKeepAlives": false,
+		"DisableCompression": false,
+		"TLSHandshakeTimeout": 4,
+		"MaxIdleConnsPerHost": 16
+	}
 }

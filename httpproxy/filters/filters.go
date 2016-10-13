@@ -1,15 +1,15 @@
 package filters
 
 import (
+	"context"
 	"fmt"
 	"net/http"
-	"os"
+	"sync"
 )
 
-const (
-	PackageName       = "httpproxy/filters"
-	EnvConfigStoreURI = "CONFIG_STORE_URI"
-	ConfigZip         = "config.zip"
+var (
+	DummyRequest  *http.Request  = &http.Request{}
+	DummyResponse *http.Response = &http.Response{}
 )
 
 type Filter interface {
@@ -17,18 +17,18 @@ type Filter interface {
 }
 
 type RequestFilter interface {
-	FilterName() string
-	Request(*Context, *http.Request) (*Context, *http.Request, error)
+	Filter
+	Request(context.Context, *http.Request) (context.Context, *http.Request, error)
 }
 
 type RoundTripFilter interface {
-	FilterName() string
-	RoundTrip(*Context, *http.Request) (*Context, *http.Response, error)
+	Filter
+	RoundTrip(context.Context, *http.Request) (context.Context, *http.Response, error)
 }
 
 type ResponseFilter interface {
-	FilterName() string
-	Response(*Context, *http.Response) (*Context, *http.Response, error)
+	Filter
+	Response(context.Context, *http.Response) (context.Context, *http.Response, error)
 }
 
 type RegisteredFilter struct {
@@ -37,11 +37,14 @@ type RegisteredFilter struct {
 
 var (
 	registeredFilters map[string]*RegisteredFilter
-	filters           map[string]Filter
+	newedFilters      map[string]Filter
+	muFilters         map[string]*sync.Mutex
 )
 
 func init() {
 	registeredFilters = make(map[string]*RegisteredFilter)
+	newedFilters = make(map[string]Filter)
+	muFilters = make(map[string]*sync.Mutex)
 }
 
 // Register a Filter
@@ -51,41 +54,30 @@ func Register(name string, registeredFilter *RegisteredFilter) error {
 	}
 
 	registeredFilters[name] = registeredFilter
+	muFilters[name] = new(sync.Mutex)
 	return nil
-}
-
-// Lookup config uri by filename
-func LookupConfigStoreURI(filterName string) string {
-	if env := os.Getenv(EnvConfigStoreURI); env != "" {
-		return env
-	}
-
-	if fi, err := os.Stat(ConfigZip); err == nil && !fi.IsDir() {
-		return "zip://" + ConfigZip
-	}
-
-	for _, dirname := range []string{".", "../" + PackageName + "/" + filterName, "../" + filterName} {
-		if _, err := os.Stat(dirname + "/" + filterName + ".json"); err == nil {
-			return "file://" + dirname
-		}
-	}
-	return "file://."
-}
-
-// NewFilter creates a new Filter of type "name"
-func NewFilter(name string) (Filter, error) {
-	filter, exists := registeredFilters[name]
-	if !exists {
-		return nil, fmt.Errorf("registeredFilters: Unknown filter %q", name)
-	}
-	return filter.New()
 }
 
 // GetFilter try get a existing Filter of type "name", otherwise create new one
 func GetFilter(name string) (Filter, error) {
-	filter, exists := filters[name]
-	if exists {
-		return filter, nil
+	muFilters[name].Lock()
+	defer muFilters[name].Unlock()
+
+	if f, ok := newedFilters[name]; ok {
+		return f, nil
 	}
-	return NewFilter(name)
+
+	filterNew, ok := registeredFilters[name]
+	if !ok {
+		return nil, fmt.Errorf("registeredFilters: Unknown filter %q", name)
+	}
+
+	filter, err := filterNew.New()
+	if err != nil {
+		return nil, err
+	}
+
+	newedFilters[name] = filter
+
+	return filter, nil
 }

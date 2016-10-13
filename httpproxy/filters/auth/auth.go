@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/base64"
 	"net"
 	"net/http"
@@ -8,8 +9,10 @@ import (
 	"time"
 
 	"github.com/cloudflare/golibs/lrucache"
-	"github.com/golang/glog"
-	"github.com/phuslu/goproxy/httpproxy/filters"
+	"github.com/phuslu/glog"
+
+	"../../filters"
+	"../../storage"
 )
 
 const (
@@ -18,7 +21,17 @@ const (
 	bypassHeader string = filterName + "/bypass"
 )
 
+type Config struct {
+	CacheSize int
+	Basic     []struct {
+		Username string
+		Password string
+	}
+	WhiteList []string
+}
+
 type Filter struct {
+	Config
 	ByPassHeaders lrucache.Cache
 	Basic         map[string]string
 	WhiteList     map[string]struct{}
@@ -26,9 +39,10 @@ type Filter struct {
 
 func init() {
 	filename := filterName + ".json"
-	config, err := NewConfig(filters.LookupConfigStoreURI(filterName), filename)
+	config := new(Config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
-		glog.Fatalf("NewConfig(%#v) failed: %s", filename, err)
+		glog.Fatalf("UnmarshallJson(%#v) failed: %s", filename, err)
 	}
 
 	err = filters.Register(filterName, &filters.RegisteredFilter{
@@ -44,6 +58,7 @@ func init() {
 
 func NewFilter(config *Config) (filters.Filter, error) {
 	f := &Filter{
+		Config:        *config,
 		ByPassHeaders: lrucache.NewMultiLRUCache(4, uint(config.CacheSize)),
 		Basic:         make(map[string]string),
 		WhiteList:     make(map[string]struct{}),
@@ -64,15 +79,15 @@ func (f *Filter) FilterName() string {
 	return filterName
 }
 
-func (f *Filter) Request(ctx *filters.Context, req *http.Request) (*filters.Context, *http.Request, error) {
+func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Context, *http.Request, error) {
 	if auth := req.Header.Get("Proxy-Authorization"); auth != "" {
 		req.Header.Del("Proxy-Authorization")
-		ctx.SetString(authHeader, auth)
+		ctx = filters.WithString(ctx, authHeader, auth)
 	}
 	return ctx, req, nil
 }
 
-func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Context, *http.Response, error) {
+func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
 
 	if ip, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 		if _, ok := f.WhiteList[ip]; ok {
@@ -80,7 +95,7 @@ func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Co
 		}
 	}
 
-	if auth, err := ctx.GetString(authHeader); err == nil {
+	if auth := filters.String(ctx, authHeader); auth != "" {
 		if _, ok := f.ByPassHeaders.Get(auth); ok {
 			glog.V(3).Infof("auth filter hit bypass cache %#v", auth)
 			return ctx, nil, nil
@@ -109,11 +124,7 @@ func (f *Filter) RoundTrip(ctx *filters.Context, req *http.Request) (*filters.Co
 	glog.V(1).Infof("UnAuthenticated URL %v from %#v", req.URL.String(), req.RemoteAddr)
 
 	noAuthResponse := &http.Response{
-		Status:        "407 Proxy authentication required",
-		StatusCode:    407,
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
+		StatusCode:    http.StatusProxyAuthRequired,
 		Header:        http.Header{},
 		Request:       req,
 		Close:         true,
